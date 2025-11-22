@@ -1,3 +1,4 @@
+
 # app/routers/crawl.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,7 +10,7 @@ from app.schemas.items import RawItem
 from app.services.ingest import upsert_items
 from app.crawlers.daangn import DaangnScraper
 # from app.crawlers.joongna import JoongnaScraper
-# from app.crawlers.bunjang import BunjangScraper
+from app.crawlers.bunjang import BunjangScraper
 
 router = APIRouter(prefix="/crawl", tags=["crawl"])
 settings = get_settings()
@@ -18,7 +19,8 @@ def get_scraper(source: MarketSource):
     if source == MarketSource.daangn:
         return DaangnScraper()
     # if source == MarketSource.joongna: return JoongnaScraper()
-    # if source == MarketSource.bunjang: return BunjangScraper()
+    if source == MarketSource.bunjang:
+        return BunjangScraper()
     raise HTTPException(status_code=400, detail="unsupported source")
 
 @router.post("/daangn/keywords")
