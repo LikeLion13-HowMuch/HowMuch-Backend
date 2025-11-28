@@ -1,16 +1,27 @@
-# app/db/session.py
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import text
 from app.core.config import get_settings
 
 settings = get_settings()
 
-# 1) Engine
-engine = create_async_engine(str(settings.DATABASE_URL), pool_pre_ping=True)
+SQLALCHEMY_DATABASE_URL = "sqlite+aiosqlite:///./howmuch.db"
 
-# 2) Session factory
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+engine = create_async_engine(
+    SQLALCHEMY_DATABASE_URL,
+    future=True,
+    echo=False,               # 디버그 시 True
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+    autocommit=False,
+)
 
 # 3) Base (ORM 모델이 상속)
 class Base(DeclarativeBase):
