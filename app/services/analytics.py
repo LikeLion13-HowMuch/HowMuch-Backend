@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from fastapi import HTTPException
 
-PRODUCT2CATEGORY = {"iPhone":1, "iPad":2, "MacBook":3, "AppleWatch":4, "AirPods":5}
+PRODUCT2CATEGORY = {"아이폰":1, "아이패드":2, "맥북":3, "애플워치":4, "에어팟":5}
 
 def rows_to_dicts(rows):
     return [dict(r) for r in rows]
@@ -32,8 +32,9 @@ async def fetch_sku_id_with_fingerprint(session: AsyncSession, product: str, spe
     ]
     
     # fingerprint 조건들을 담을 리스트
-    fingerprint_conditions = [f"fingerprint LIKE '%cat:{category_id}%'"]
+    fingerprint_conditions = []
     params: Dict[str, Any] = {}
+    params["category_id"] = category_id
     
     # spec을 알파벳 순서로 정렬
     sorted_spec = sorted(spec.items(), key=lambda x: x[0])
@@ -61,7 +62,7 @@ async def fetch_sku_id_with_fingerprint(session: AsyncSession, product: str, spe
             query = text("""
                 SELECT ao.option_id
                 FROM attributes a
-                JOIN attrubute_options ao ON ao.attrubute_id = a.attrubute_id
+                JOIN attribute_options ao ON ao.attribute_id = a.attribute_id
                 WHERE LOWER(a.code) = :code
                   AND LOWER(ao.value) = :value
                 LIMIT 1
@@ -86,7 +87,8 @@ async def fetch_sku_id_with_fingerprint(session: AsyncSession, product: str, spe
     print(f"Params: {params}")
     
     # fingerprint로 모든 매칭되는 sku_id 조회
-    query = text(f"SELECT sku_id FROM sku WHERE {where_clause}")
+    query = text(f"SELECT sku_id FROM sku WHERE category_id = :category_id AND {where_clause}")
+    
     result = await session.execute(query, params)
     sku_ids = [row[0] for row in result.fetchall()]
     
@@ -251,7 +253,7 @@ async def fetch_regional_analysis(session: AsyncSession, sku_ids: List[int], reg
     params: Dict[str, Any] = {f"sku_{i}": sku_id for i, sku_id in enumerate(sku_ids)}
 
     if not region:
-        raise ValueError("Region 'sgg' is required for regional analysis")
+        raise ValueError("Region is required for regional analysis")
 
     if not region.get("sgg") or not region.get("emd"):
         params["sd_name"] = "서울특별시"
