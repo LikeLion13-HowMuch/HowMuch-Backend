@@ -1,434 +1,315 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-크롤링된 아이템에서 SKU를 생성하고 가격 통계를 집계하는 스크립트
+# app/services/sku_pipeline.py
+from __future__ import annotations
 
-워크플로우:
-1. items 테이블의 모든 아이템 조회
-2. 각 아이템의 속성 값(item_attribute_values) 조회
-3. 속성 조합으로 SKU 생성 (fingerprint 기반)
-4. SKU별 가격 통계 집계 (지역별, 시간별)
-"""
-
-import os
+from dataclasses import dataclass
+from typing import Dict, Optional, Iterable, Tuple
 import hashlib
-import json
-from datetime import datetime, timedelta
-from collections import defaultdict
-from dotenv import load_dotenv
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import re
+import logging
 
-# .env 파일 로드
-load_dotenv()
+from sqlalchemy import select, update, text, and_, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# DB 연결 정보
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432"),
-    "dbname": os.getenv("DB_NAME", "howmuch"),
-    "user": os.getenv("DB_USER", "postgres"),
-    "password": os.getenv("DB_PASSWORD", ""),
-}
+from app.core.logging import get_logger
+from app.db.models import (
+    Item, ItemStatus,
+    ItemAttributeValue, Attribute, AttributeDataType,
+    Sku, SkuAttribute, PriceStats,
+)
+
+logger: logging.Logger = get_logger(__name__)
 
 
-def connect_db():
-    """데이터베이스 연결"""
-    return psycopg2.connect(**DB_CONFIG)
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 
-
-def generate_fingerprint(attributes_dict):
+def _fingerprint_from_specs(specs: Dict[str, str]) -> str:
     """
-    속성 조합으로 고유한 fingerprint 생성
+    사전형 스펙에서 SKU 식별용 fingerprint 생성.
 
-    예: {'model': 'iPhone 15 Pro', 'capacity': '256GB', 'color': '블랙'}
-        → "model:iPhone 15 Pro|capacity:256GB|color:블랙"
-        → SHA256 해시
+    - 키/값을 정렬하여 "k:v|k2:v2|..." 형태로 합친 후 sha256 32자.
+    - 같은 스펙이면 항상 같은 fingerprint가 나옴.
+
+    Args:
+        specs: {'model_series':'iPhone 13','color':'Blue','capacity_gb':'256', ...}
+
+    Returns:
+        32자리 해시 문자열
     """
-    # 속성을 정렬하여 일관된 순서 보장
-    sorted_attrs = sorted(attributes_dict.items())
-
-    # 문자열로 직렬화
-    attr_string = "|".join(f"{k}:{v}" for k, v in sorted_attrs)
-
-    # SHA256 해시 생성 (앞 32자만 사용)
-    hash_obj = hashlib.sha256(attr_string.encode('utf-8'))
-    return hash_obj.hexdigest()[:32]
+    pairs = [f"{k}:{v}" for k, v in sorted(specs.items())]
+    joined = "|".join(pairs)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:32]
 
 
-def get_item_attributes(conn, item_id):
+_num_unit = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*(tb|gb)?\s*$', re.I)
+
+
+def _normalize_numeric_str(val: str) -> Optional[int]:
     """
-    아이템의 모든 속성 값을 조회하여 딕셔너리로 반환
+    '256GB', '1 TB', '512' 같은 값을 정규화하여 정수(GB 기준)로 변환.
 
-    반환 예시:
-    {
-        'model': 'iPhone 15 Pro',
-        'capacity': '256GB',
-        'color': '블랙'
-    }
+    - TB이면 1024배
+    - 숫자가 아니면 None
+
+    Returns:
+        int(GB) 또는 None
     """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT
-                a.code AS attr_code,
-                a.datatype,
-                iav.value_text,
-                iav.value_int,
-                iav.value_decimal,
-                iav.value_bool,
-                ao.value AS option_value
-            FROM item_attribute_values iav
-            JOIN attributes a ON iav.attribute_id = a.attribute_id
-            LEFT JOIN attribute_options ao ON iav.option_id = ao.option_id
-            WHERE iav.item_id = %s
-        """, (item_id,))
-
-        attributes = {}
-        for row in cur.fetchall():
-            attr_code = row['attr_code']
-            datatype = row['datatype']
-
-            # 데이터 타입에 따라 값 추출
-            if row['option_value']:
-                value = row['option_value']
-            elif datatype == 'text':
-                value = row['value_text']
-            elif datatype == 'int':
-                value = str(row['value_int'])
-            elif datatype == 'decimal':
-                value = str(row['value_decimal'])
-            elif datatype == 'bool':
-                value = str(row['value_bool'])
-            else:
-                value = None
-
-            if value:
-                attributes[attr_code] = value
-
-        return attributes
+    m = _num_unit.match(val or "")
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    if unit == "tb":
+        num *= 1024
+    return int(num)
 
 
-def get_or_create_sku(conn, category_id, fingerprint, attributes_dict):
+# ------------------------------------------------------------------------------
+# Stage 1) SKU 생성/갱신 + items.sku_id 업데이트
+# ------------------------------------------------------------------------------
+
+async def _load_item_specs(session: AsyncSession, item_id: int) -> Dict[str, str]:
     """
-    SKU를 조회하거나 생성
+    단일 item의 EAV 속성을 읽어, 'attribute.code'를 키로, 문자열화된 값을 값으로 하는 dict 반환.
 
-    반환: sku_id
+    - Attribute.datatype 에 따라 텍스트/정수/소수/불리언/옵션을 문자열로 통일.
+    - 필요 시 수치 정규화(예: '256GB' → '256')를 추가로 적용할 수 있음.
+
+    Returns:
+        {'model_series':'iPhone 13','color':'Blue','capacity_gb':'256', ...}
     """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # 기존 SKU 조회
-        cur.execute("""
-            SELECT sku_id
-            FROM sku
-            WHERE category_id = %s AND fingerprint = %s
-        """, (category_id, fingerprint))
+    q = (
+        select(ItemAttributeValue, Attribute)
+        .join(Attribute, Attribute.attribute_id == ItemAttributeValue.attribute_id)
+        .where(ItemAttributeValue.item_id == item_id)
+    )
+    rows = (await session.execute(q)).all()
 
-        result = cur.fetchone()
+    specs: Dict[str, str] = {}
+    for iav, attr in rows:
+        code = attr.code  # 예: 'model_series', 'color', 'capacity_gb'
+        dt: AttributeDataType = attr.datatype
 
-        if result:
-            return result['sku_id']
+        val_str: Optional[str] = None
+        if dt == AttributeDataType.text and iav.value_text is not None:
+            val_str = str(iav.value_text).strip()
+        elif dt == AttributeDataType.int and iav.value_int is not None:
+            val_str = str(iav.value_int)
+        elif dt == AttributeDataType.decimal and iav.value_decimal is not None:
+            # 소수도 문자열로 고정 (fingerprint 안정성)
+            val_str = f"{iav.value_decimal}".rstrip("0").rstrip(".")
+        elif dt == AttributeDataType.bool and iav.value_bool is not None:
+            val_str = "1" if iav.value_bool else "0"
+        else:
+            # enum/option 형식은 value_text로 들어왔을 것으로 가정.
+            # 필요시 attribute_options 조인으로 label 값 가져와도 됨.
+            if iav.value_text is not None:
+                val_str = str(iav.value_text).strip()
 
-        # 새 SKU 생성
-        cur.execute("""
-            INSERT INTO sku (category_id, fingerprint)
-            VALUES (%s, %s)
-            RETURNING sku_id
-        """, (category_id, fingerprint))
+        # 예: 용량 정규화 ('256GB' → '256')
+        if code in {"capacity", "capacity_gb", "storage_gb"} and val_str:
+            n = _normalize_numeric_str(val_str)
+            if n is not None:
+                val_str = str(n)
 
-        sku_id = cur.fetchone()['sku_id']
-        conn.commit()
+        if code and val_str:
+            specs[code] = val_str
 
-        # SKU 속성 저장
-        save_sku_attributes(conn, sku_id, attributes_dict)
-
-        return sku_id
+    return specs
 
 
-def save_sku_attributes(conn, sku_id, attributes_dict):
+async def _ensure_sku(session: AsyncSession, category_id: int, specs: Dict[str, str]) -> Tuple[int, bool]:
     """
-    SKU의 속성 값을 sku_attribute 테이블에 저장
+    카테고리 + 스펙(fingerprint)으로 SKU를 조회/생성.
+
+    - 존재하면 sku_id 반환
+    - 없으면 생성 + 관련 SkuAttribute(표준화된 값) 일부 저장
+
+    Returns:
+        (sku_id, created)  created=True면 신규 생성
     """
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        for attr_code, value in attributes_dict.items():
-            # 속성 ID 조회
-            cur.execute("SELECT attribute_id, datatype FROM attributes WHERE code = %s", (attr_code,))
-            attr = cur.fetchone()
+    fp = _fingerprint_from_specs(specs)
 
-            if not attr:
-                continue
+    # 1) 기존 SKU 조회
+    q = select(Sku).where(and_(Sku.category_id == category_id, Sku.fingerprint == fp))
+    sku = (await session.execute(q)).scalar_one_or_none()
+    if sku:
+        return sku.sku_id, False
 
-            attribute_id = attr['attribute_id']
-            datatype = attr['datatype']
+    # 2) 신규 생성
+    sku = Sku(category_id=category_id, fingerprint=fp)
+    session.add(sku)
+    await session.flush()  # sku_id 확보
 
-            # 옵션 ID 조회 (해당하는 경우)
-            option_id = None
-            cur.execute("""
-                SELECT option_id
-                FROM attribute_options
-                WHERE attribute_id = %s AND value = %s
-            """, (attribute_id, value))
-            opt_result = cur.fetchone()
-            if opt_result:
-                option_id = opt_result['option_id']
+    # 3) (선택) 대표 속성들을 sku_attribute에 저장해 표시/검색에 활용
+    #    - 저장 정책은 팀 규칙에 맞게 조정(모든 속성 vs 일부만)
+    saved_count = 0
+    for code, val in specs.items():
+        # Attribute.code 로 ID 찾아 매핑
+        a = (
+            await session.execute(
+                select(Attribute).where(Attribute.code == code)
+            )
+        ).scalar_one_or_none()
+        if not a:
+            continue
 
-            # 데이터 타입에 따라 값 저장
-            value_text = value if datatype == 'text' else None
-            value_int = int(value) if datatype == 'int' else None
-            value_decimal = float(value) if datatype == 'decimal' else None
-            value_bool = value.lower() in ['true', '1', 'yes'] if datatype == 'bool' else None
+        sa = SkuAttribute(
+            sku_id=sku.sku_id,
+            attribute_id=a.attribute_id,
+            value_text=val,  # 간단히 텍스트로 보관(정렬 필요하면 타입 나눠서 저장)
+        )
+        session.add(sa)
+        saved_count += 1
 
-            # sku_attribute에 삽입 (중복 시 무시)
-            cur.execute("""
-                INSERT INTO sku_attribute
-                (sku_id, attribute_id, option_id, value_text, value_int, value_decimal, value_bool)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (sku_id, attribute_id) DO NOTHING
-            """, (sku_id, attribute_id, option_id, value_text, value_int, value_decimal, value_bool))
-
-        conn.commit()
+    logger.debug("Created SKU %s (category=%s, attrs=%d)", sku.sku_id, category_id, saved_count)
+    return sku.sku_id, True
 
 
-def generate_skus_for_all_items():
+async def ensure_sku_for_items(session: AsyncSession, limit: Optional[int] = None) -> int:
     """
-    모든 아이템에 대해 SKU 생성
+    items의 속성(EAV)을 묶어 SKU를 생성/갱신하고, items.sku_id를 채운다.
+
+    - 대상: sku_id 가 NULL 인 아이템(또는 limit가 있으면 상위 N개)
+    - 스펙 → fingerprint → SKU upsert → items.sku_id 업데이트
+
+    Args:
+        session: AsyncSession
+        limit: 처리할 최대 개수(없으면 전부)
+
+    Returns:
+        처리한 item 개수
     """
-    print("\n" + "=" * 60)
-    print("🏷️  SKU 생성 시작")
-    print("=" * 60)
+    # 대상 item 조회
+    q = select(Item.item_id, Item.category_id).where(Item.sku_id.is_(None))
+    if limit:
+        q = q.limit(limit)
+    rows = (await session.execute(q)).all()
+    if not rows:
+        logger.info("SKU 대상 item 없음 (sku_id IS NULL).")
+        return 0
 
-    conn = connect_db()
+    updated = 0
+    for item_id, category_id in rows:
+        specs = await _load_item_specs(session, item_id)
+        if not specs:
+            # 속성이 하나도 없으면 SKU를 만들지 않음
+            continue
 
+        sku_id, created = await _ensure_sku(session, category_id, specs)
+
+        # items.sku_id 업데이트
+        await session.execute(
+            update(Item).where(Item.item_id == item_id).values(sku_id=sku_id)
+        )
+        updated += 1
+
+    logger.info("SKU 매핑 완료: %d개 items 갱신", updated)
+    return updated
+
+
+# ------------------------------------------------------------------------------
+# Stage 2) price_stats 적재/업데이트 (판매중만)
+# ------------------------------------------------------------------------------
+
+@dataclass
+class StatsOptions:
+    """
+    통계 적재 옵션.
+    """
+    bucket: str = "day"          # 'hour' | 'day' | 'week' | 'month'
+    timezone: str = "Asia/Seoul" # 버킷 산정 타임존
+
+
+async def refresh_price_stats(session: AsyncSession, options: StatsOptions = StatsOptions()) -> int:
+    """
+    `items`에서 판매중만 골라 버킷(date_trunc) 단위로 price_stats에 업서트.
+
+    - 집계: COUNT, SUM, AVG, MIN, MAX
+    - 키: (sku_id, region_id, bucket_ts)
+    - 타임존 기준 버킷 산정: date_trunc(bucket, created_at AT TIME ZONE :tz)
+    - 이미 존재하면 DO UPDATE 로 교체
+
+    Args:
+        session: AsyncSession
+        options: StatsOptions(bucket, timezone)
+
+    Returns:
+        upsert된 그룹 개수(추정). (실제 변경 건수는 드라이버/버전에 따라 0 반환될 수 있음)
+    """
+    # ItemStatus가 Enum이면 active 값 문자열을 얻고, 아니면 '판매중' 등 문자열 직접 사용
+    active_value = None
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 모든 아이템 조회
-            cur.execute("SELECT item_id, category_id FROM items ORDER BY item_id")
-            items = cur.fetchall()
+        active_value = ItemStatus.active  # Enum
+    except Exception:
+        active_value = "판매중"           # 문자열 상태를 쓴다면 팀 규칙에 맞게 조정
 
-        print(f"\n📦 총 {len(items)}개 아이템 처리 중...")
+    # 일부 드라이버는 rowcount를 정확히 돌려주지 않아서 "추정치"임
+    sql = text(f"""
+        INSERT INTO price_stats (sku_id, region_id, bucket_ts, items_num, sum_price, avg_price, min_price, max_price)
+        SELECT
+            i.sku_id,
+            i.region_id,
+            date_trunc(:bucket, i.created_at AT TIME ZONE :tz)::timestamptz AS bucket_ts,
+            COUNT(*) AS items_num,
+            SUM(i.price) AS sum_price,
+            AVG(i.price)::numeric(12,2) AS avg_price,
+            MIN(i.price) AS min_price,
+            MAX(i.price) AS max_price
+        FROM items AS i
+        WHERE
+            i.sku_id IS NOT NULL
+            AND i.region_id IS NOT NULL
+            AND i.status = :active
+        GROUP BY 1, 2, 3
+        ON CONFLICT (sku_id, region_id, bucket_ts)
+        DO UPDATE SET
+            items_num = EXCLUDED.items_num,
+            sum_price = EXCLUDED.sum_price,
+            avg_price = EXCLUDED.avg_price,
+            min_price = EXCLUDED.min_price,
+            max_price = EXCLUDED.max_price;
+    """)
 
-        sku_created = 0
-        sku_existing = 0
-        sku_map = {}  # item_id → sku_id 매핑
-
-        for idx, item in enumerate(items, 1):
-            item_id = item['item_id']
-            category_id = item['category_id']
-
-            # 아이템의 속성 조회
-            attributes = get_item_attributes(conn, item_id)
-
-            if not attributes:
-                # 속성이 없는 아이템은 스킵
-                continue
-
-            # Fingerprint 생성
-            fingerprint = generate_fingerprint(attributes)
-
-            # SKU 조회 또는 생성
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT sku_id
-                    FROM sku
-                    WHERE category_id = %s AND fingerprint = %s
-                """, (category_id, fingerprint))
-
-                result = cur.fetchone()
-
-                if result:
-                    sku_id = result['sku_id']
-                    sku_existing += 1
-                else:
-                    sku_id = get_or_create_sku(conn, category_id, fingerprint, attributes)
-                    sku_created += 1
-
-            # 매핑 저장
-            sku_map[item_id] = sku_id
-
-            if idx % 100 == 0:
-                print(f"  처리 중: {idx}/{len(items)} ({idx * 100 // len(items)}%)")
-
-        print(f"\n✅ SKU 생성 완료:")
-        print(f"  - 새로 생성: {sku_created}개")
-        print(f"  - 기존 사용: {sku_existing}개")
-
-        return sku_map
-
-    finally:
-        conn.close()
+    res = await session.execute(
+        sql,
+        {
+            "bucket": options.bucket,
+            "tz": options.timezone,
+            "active": active_value,
+        },
+    )
+    # 주의: asyncpg + SQLAlchemy에선 rowcount가 의미 없을 수 있음
+    logger.info("price_stats 업서트 완료 (bucket=%s, tz=%s)", options.bucket, options.timezone)
+    return res.rowcount if res.rowcount is not None else 0
 
 
-def aggregate_price_stats(sku_map, bucket_interval='day'):
+# ------------------------------------------------------------------------------
+# Pipeline entrypoint
+# ------------------------------------------------------------------------------
+
+async def run_pipeline(session: AsyncSession, ensure_sku_limit: Optional[int] = None, *,
+                       bucket: str = "day", timezone: str = "Asia/Seoul") -> None:
     """
-    SKU별, 지역별, 시간별 가격 통계 집계
+    전체 파이프라인 실행:
+      1) SKU 미지정 item에 대한 SKU 생성/매핑
+      2) 판매중만 대상으로 price_stats 집계 업서트
 
-    bucket_interval: 'day', 'week', 'month'
+    Args:
+        session: AsyncSession (FastAPI DI 또는 수동 생성)
+        ensure_sku_limit: SKU 매핑 단계에서 처리할 최대 item 개수(없으면 전부)
+        bucket: date_trunc 버킷 (hour/day/week/month)
+        timezone: 버킷 산정 타임존
     """
-    print("\n" + "=" * 60)
-    print("📊 가격 통계 집계 시작")
-    print("=" * 60)
+    logger.info("=== SKU/Stats 파이프라인 시작 ===")
+    # 1) SKU 매핑
+    cnt = await ensure_sku_for_items(session, limit=ensure_sku_limit)
+    logger.info("SKU 매핑 건수: %d", cnt)
 
-    conn = connect_db()
+    # 2) price_stats 업서트
+    affected = await refresh_price_stats(session, StatsOptions(bucket=bucket, timezone=timezone))
+    logger.info("price_stats 업서트 완료(추정 rowcount=%s)", affected)
 
-    try:
-        # 통계 데이터 구조: (sku_id, region_id, bucket_ts) → [prices]
-        stats_data = defaultdict(list)
-
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 모든 아이템의 가격 정보 조회
-            cur.execute("""
-                SELECT
-                    i.item_id,
-                    i.category_id,
-                    i.region_id,
-                    i.price,
-                    i.created_at
-                FROM items i
-                ORDER BY i.created_at DESC
-            """)
-
-            items = cur.fetchall()
-
-        print(f"\n📦 총 {len(items)}개 아이템 집계 중...")
-
-        for item in items:
-            item_id = item['item_id']
-            region_id = item['region_id']
-            price = item['price']
-            created_at = item['created_at']
-
-            # 아이템의 SKU 조회
-            sku_id = sku_map.get(item_id)
-            if not sku_id:
-                continue
-
-            # 시간 버킷 계산
-            bucket_ts = truncate_to_bucket(created_at, bucket_interval)
-
-            # 통계 데이터에 추가
-            key = (sku_id, region_id, bucket_ts)
-            stats_data[key].append(price)
-
-        print(f"\n📈 {len(stats_data)}개 통계 버킷 생성됨")
-
-        # price_stats 테이블에 저장
-        saved_count = 0
-        with conn.cursor() as cur:
-            for (sku_id, region_id, bucket_ts), prices in stats_data.items():
-                items_num = len(prices)
-                sum_price = sum(prices)
-                avg_price = sum_price / items_num
-                min_price = min(prices)
-                max_price = max(prices)
-
-                cur.execute("""
-                    INSERT INTO price_stats
-                    (sku_id, region_id, bucket_ts, items_num, sum_price, avg_price, min_price, max_price)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (sku_id, region_id, bucket_ts)
-                    DO UPDATE SET
-                        items_num = EXCLUDED.items_num,
-                        sum_price = EXCLUDED.sum_price,
-                        avg_price = EXCLUDED.avg_price,
-                        min_price = EXCLUDED.min_price,
-                        max_price = EXCLUDED.max_price
-                """, (sku_id, region_id, bucket_ts, items_num, sum_price, avg_price, min_price, max_price))
-
-                saved_count += 1
-
-            conn.commit()
-
-        print(f"\n✅ 가격 통계 저장 완료: {saved_count}개 버킷")
-
-        # 통계 샘플 출력
-        print_stats_sample(conn)
-
-    finally:
-        conn.close()
-
-
-def truncate_to_bucket(dt, interval):
-    """
-    날짜/시간을 버킷 단위로 절삭
-
-    interval: 'day', 'week', 'month'
-    """
-    if interval == 'day':
-        return dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif interval == 'week':
-        # 주의 시작 (월요일)
-        start_of_week = dt - timedelta(days=dt.weekday())
-        return start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif interval == 'month':
-        # 월의 시작
-        return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    else:
-        return dt
-
-
-def print_stats_sample(conn):
-    """
-    통계 샘플 출력 (상위 10개)
-    """
-    print("\n" + "=" * 60)
-    print("📊 가격 통계 샘플 (상위 10개)")
-    print("=" * 60)
-
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT
-                ps.sku_id,
-                c.name AS category_name,
-                e.name AS region_name,
-                ps.bucket_ts,
-                ps.items_num,
-                ps.avg_price,
-                ps.min_price,
-                ps.max_price
-            FROM price_stats ps
-            JOIN sku s ON ps.sku_id = s.sku_id
-            JOIN category c ON s.category_id = c.category_id
-            LEFT JOIN emd e ON ps.region_id = e.region_id
-            ORDER BY ps.bucket_ts DESC, ps.items_num DESC
-            LIMIT 10
-        """)
-
-        rows = cur.fetchall()
-
-        if not rows:
-            print("  (통계 데이터 없음)")
-            return
-
-        for row in rows:
-            print(f"\n  SKU #{row['sku_id']} ({row['category_name']})")
-            print(f"  지역: {row['region_name'] or '전체'}")
-            print(f"  기간: {row['bucket_ts'].strftime('%Y-%m-%d')}")
-            print(f"  아이템 수: {row['items_num']}개")
-            print(f"  평균 가격: {int(row['avg_price']):,}원")
-            print(f"  최소/최대: {row['min_price']:,}원 ~ {row['max_price']:,}원")
-            print("  " + "-" * 50)
-
-
-def main():
-    """
-    메인 실행 함수
-    """
-    print("=" * 60)
-    print("🚀 SKU 생성 및 가격 통계 집계")
-    print("=" * 60)
-
-    # 1. SKU 생성
-    sku_map = generate_skus_for_all_items()
-
-    if not sku_map:
-        print("\n⚠️  SKU를 생성할 아이템이 없습니다.")
-        return
-
-    # 2. 가격 통계 집계
-    aggregate_price_stats(sku_map, bucket_interval='day')
-
-    print("\n" + "=" * 60)
-    print("🎉 처리 완료!")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    main()
+    await session.commit()
+    logger.info("=== SKU/Stats 파이프라인 종료 ===")

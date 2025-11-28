@@ -1,5 +1,7 @@
-from pydantic import BaseSettings, AnyUrl
 from functools import lru_cache
+from typing import Optional
+from pydantic import AnyUrl  
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     DATABASE_URL: AnyUrl  # postgresql+asyncpg://app:app@localhost:5432/howmuch
@@ -12,8 +14,7 @@ class Settings(BaseSettings):
 
     CATEGORY_IPHONE: int = 1
 
-    class Config:
-        env_file = ".env"
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 @lru_cache
 def get_settings():

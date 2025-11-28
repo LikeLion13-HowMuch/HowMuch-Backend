@@ -1,10 +1,9 @@
-"""
-FastAPI Application Entry Point
-"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import products
 from app.core.scheduler import start_scheduler
+from app.api.v1.analytics import router as analytics_router
+from contextlib import asynccontextmanager
+from app.core.scheduler import start_scheduler, shutdown_scheduler
 
 app = FastAPI(
     title="HowMuch API",
@@ -23,51 +22,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 라우터 등록
-app.include_router(products.router, prefix="/api/v1", tags=["products"])
-
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    서버 시작 시 실행
-    - 크롤링 스케줄러 시작
-    """
-    print("=" * 50)
-    print("HowMuch API Server Starting...")
-    print("=" * 50)
-
-    # 스케줄러 시작
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     start_scheduler()
+    try:
+        yield
+    finally:
+        shutdown_scheduler()
 
-    print("Server started successfully!")
+app = FastAPI(lifespan=lifespan)
 
+# 라우터 등록
+app.include_router(analytics_router, prefix="/api/v1")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """
-    서버 종료 시 실행
-    """
-    print("=" * 50)
-    print("HowMuch API Server Shutting Down...")
-    print("=" * 50)
-
-
-@app.get("/")
-async def root():
-    """
-    루트 엔드포인트
-    """
-    return {
-        "message": "HowMuch API is running",
-        "version": "1.0.0",
-        "docs": "/docs"
-    }
-
-
-@app.get("/health")
-async def health_check():
-    """
-    헬스 체크 엔드포인트
-    """
-    return {"status": "healthy"}
