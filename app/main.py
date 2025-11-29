@@ -13,14 +13,6 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# CORS 설정
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # TODO: 프론트엔드 도메인으로 제한 필요
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,6 +23,19 @@ async def lifespan(app: FastAPI):
         shutdown_scheduler()
 
 app = FastAPI(lifespan=lifespan)
+
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,     # 프론트엔드 주소
+    allow_credentials=True,
+    allow_methods=["*"],       # GET, POST, OPTIONS 등 모두 허용
+    allow_headers=["*"],       # Authorization 등 헤더 허용
+)
 
 # 라우터 등록
 app.include_router(analytics_router, prefix="/api/v1")

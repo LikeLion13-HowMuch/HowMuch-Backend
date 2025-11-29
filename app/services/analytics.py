@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from fastapi import HTTPException
 
-PRODUCT2CATEGORY = {"아이폰":1, "아이패드":2, "맥북":3, "애플워치":4, "에어팟":5}
+PRODUCT2CATEGORY = {"iPhone":1, "iPad":2, "MacBook":3, "AppleWatch":4, "AirPods":5}
 
 def rows_to_dicts(rows):
     return [dict(r) for r in rows]
